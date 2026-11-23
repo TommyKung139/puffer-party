@@ -1,0 +1,10 @@
+{
+  "name": "krillion-puffer-party",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "河豚派對 — a QR-code party word game. Big screen hosts, phones answer, Claude fact-checks.",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  }
+}

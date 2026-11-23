@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#06233f">
+  <title>加入河豚派對 🐡</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐡</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bungee&family=Noto+Sans+TC:wght@500;700;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+</head>
+<body class="phone">
+  <div class="sea" aria-hidden="true"></div>
+  <div id="conn" class="conn" hidden></div>
+
+  <section id="joinView" class="p-join">
+    <div class="p-brand">
+      <div class="p-brand-fish" id="brandFish"></div>
+      <h1>河豚派對</h1>
+      <p class="sub">KRILLION PUFFER PARTY</p>
+    </div>
+    <form id="joinForm" autocomplete="off">
+      <label id="roomField">房號
+        <input id="roomInput" maxlength="6" autocapitalize="characters" spellcheck="false" placeholder="ABCD">
+      </label>
+      <label>你的名字
+        <input id="nameInput" maxlength="12" autocomplete="nickname" placeholder="最多 12 個字">
+      </label>
+      <button id="joinBtn" class="btn big primary" type="submit">加入遊戲</button>
+      <p class="err" id="joinErr"></p>
+    </form>
+  </section>
+
+  <section id="gameView" class="p-game" hidden>
+    <header class="p-me" id="me"></header>
+    <div class="p-stage" id="stage"></div>
+    <div class="p-bar" id="pbarWrap" hidden><div class="p-bar-fill" id="pbar"></div><span id="pcd"></span></div>
+    <form id="answerForm" class="p-answer" autocomplete="off" hidden>
+      <input id="answerInput" maxlength="60" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="send">
+      <button id="sendBtn" class="btn primary" type="submit">送出</button>
+    </form>
+    <button id="skipBtn" class="btn ghost skip" type="button" hidden>😵 不知道（直接吃一個 ✕）</button>
+    <div class="p-answers" id="pAnswers"></div>
+  </section>
+
+  <script type="module" src="js/play.js"></script>
+</body>
+</html>
