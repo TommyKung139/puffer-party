@@ -1,5 +1,5 @@
 // POST /api/category { exclude: string[] } -> { categories: string[] }
-import { askClaude, extractJSON, clip, readBody, sameOrigin, hasKey } from './_anthropic.js';
+import { askClaude, extractJSON, clip, readBody, sameOrigin, hasKey, sendAIError } from './_anthropic.js';
 
 const SYSTEM = `You write categories for a fast party word game played by friends in Taiwan.
 Players take turns naming one thing that fits the category, with only a few seconds each, until nobody can think of more.
@@ -26,15 +26,15 @@ export default async function handler(req, res) {
     : 'Give me 8 categories.';
 
   try {
-    const text = await askClaude({ system: SYSTEM, user, maxTokens: 500, timeoutMs: 15000 });
-    const j = extractJSON(text);
+    const out = await askClaude({ system: SYSTEM, user, maxTokens: 500, budgetMs: 12000 });
+    const j = extractJSON(out.text);
     const categories = (Array.isArray(j.categories) ? j.categories : [])
       .map((c) => clip(c, 40))
       .filter(Boolean)
       .slice(0, 10);
     return res.status(200).json({ categories });
   } catch (err) {
-    console.error('category error', err);
-    return res.status(502).json({ error: String(err.message || err) });
+    console.error('category error', err.kind, err.message);
+    return sendAIError(res, err);
   }
 }

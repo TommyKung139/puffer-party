@@ -23,11 +23,12 @@ function passTurn(e, text) {
   e.commit();
 }
 
-test('needs 4-8 players', () => {
-  const e = setup(3);
+test('needs 2-8 players', () => {
+  const e = setup(1);
   assert.equal(e.canStart(), false);
-  e.addPlayer('p3', 'P3');
+  e.addPlayer('p1', 'P1');
   assert.equal(e.canStart(), true);
+  for (let i = 2; i < 4; i++) e.addPlayer(`p${i}`, `P${i}`);
   for (let i = 4; i < 8; i++) e.addPlayer(`p${i}`, `P${i}`);
   assert.equal(e.addPlayer('p9', 'late').ok, false);
 });
@@ -162,6 +163,22 @@ test('kicking the current player mid-game moves on', () => {
   assert.equal(e.player('p0').out, true);
   assert.equal(e.currentId, 'p1');
   assert.equal(e.phase, PHASE.TURN);
+});
+
+test('2-player game: lap rule and win', () => {
+  const e = setup(2);
+  e.start(first);
+  e.beginTurn();
+  failTurn(e); // p0
+  failTurn(e); // p1 -> back to p0 who already failed
+  assert.equal(e.phase, PHASE.NEWCAT);
+  assert.equal(e.currentId, 'p0');
+  e.beginTurn();
+  e.player('p1').strikes = 2;
+  passTurn(e, 'a'); // p0
+  failTurn(e); // p1 out
+  assert.equal(e.phase, PHASE.OVER);
+  assert.equal(e.winnerId, 'p0');
 });
 
 test('rematch resets strikes', () => {

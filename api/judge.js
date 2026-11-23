@@ -1,7 +1,7 @@
 // POST /api/judge  { category, answer, previous: string[] }
 //   -> { verdict: 'pass' | 'fail' | 'unsure', reason }
 // GET  /api/judge  -> { ok, ai } (lets the host screen know whether AI is configured)
-import { askClaude, extractJSON, clip, readBody, sameOrigin, hasKey } from './_anthropic.js';
+import { askClaude, extractJSON, clip, readBody, sameOrigin, hasKey, sendAIError, MODEL, FALLBACK_MODEL } from './_anthropic.js';
 
 const SYSTEM = `You are the referee of a fast party word game played by friends in Taiwan.
 Each round has a CATEGORY. On their turn a player must name ONE thing that belongs to it. You decide if the answer counts.
@@ -18,7 +18,7 @@ Reply with ONLY a JSON object and nothing else:
 
 export default async function handler(req, res) {
   if (req.method === 'GET') {
-    return res.status(200).json({ ok: true, ai: hasKey() });
+    return res.status(200).json({ ok: true, ai: hasKey(), model: MODEL, fallback: FALLBACK_MODEL });
   }
   if (req.method !== 'POST') return res.status(405).json({ error: 'method not allowed' });
   if (!sameOrigin(req)) return res.status(403).json({ error: 'forbidden origin' });
@@ -39,13 +39,14 @@ ${previous.length ? previous.map((p) => `- ${p}`).join('\n') : '(none yet)'}
 <answer>${answer}</answer>`;
 
   try {
-    const text = await askClaude({ system: SYSTEM, user, maxTokens: 120 });
-    const j = extractJSON(text);
+    const out = await askClaude({ system: SYSTEM, user, maxTokens: 120, budgetMs: 8000 });
+    let j;
+    try { j = extractJSON(out.text); } catch { j = { verdict: 'unsure', reason: '' }; }
     const verdict = ['pass', 'fail', 'unsure'].includes(j.verdict) ? j.verdict : 'unsure';
     const reason = clip(j.reason, 60);
-    return res.status(200).json({ verdict, reason });
+    return res.status(200).json({ verdict, reason, model: out.model, attempts: out.attempts, rateLimit: out.rateLimit });
   } catch (err) {
-    console.error('judge error', err);
-    return res.status(502).json({ error: String(err.message || err) });
+    console.error('judge error', err.kind, err.status, err.message);
+    return sendAIError(res, err);
   }
 }

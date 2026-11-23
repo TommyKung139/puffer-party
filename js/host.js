@@ -15,7 +15,7 @@ const DEV = params.has('dev'); // ?dev lets you start with 1+ players for testin
 // ---------------- settings ----------------
 const SETTINGS_KEY = 'kpp-host-settings';
 const settings = Object.assign(
-  { turnSeconds: 5, judge: 'ai', source: 'bank', custom: '' },
+  { turnSeconds: 5, judge: 'ai', source: 'bank', custom: '', aiFallback: 'pass' },
   (() => { try { return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; } catch { return {}; } })(),
 );
 const saveSettings = () => { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* private mode */ } };
@@ -70,7 +70,7 @@ const cats = (() => {
 
 // ---------------- engine + clock ----------------
 const engine = new Engine({
-  minPlayers: DEV ? 1 : 4,
+  minPlayers: DEV ? 1 : 2,
   maxPlayers: 8,
   maxStrikes: 3,
   turnSeconds: settings.turnSeconds,
@@ -144,20 +144,73 @@ function timeLeft() {
 }
 
 // ---------------- judging ----------------
-async function callJudge(category, answer, previous) {
+// The game must never stall on the AI. Three layers of protection:
+//  1. The server retries rate-limit / overload errors and falls back to a second model.
+//  2. aiGate keeps pre-checks inside your API rate limit, so real answers always have room.
+//  3. If a real answer still has no verdict after AI_WAIT_MS, it counts as a pass
+//     (tagged on screen, host can overrule with O) — or goes to the host, per settings.
+const AI_WAIT_MS = 4500;
+
+const aiGate = {
+  limit: 50, // requests/min; updated from the API's rate-limit headers
+  calls: [],
+  lastAt: 0,
+  cooldownUntil: 0,
+  troubleAt: 0,
+  recent() {
+    const now = Date.now();
+    this.calls = this.calls.filter((t) => now - t < 60000);
+    return this.calls.length;
+  },
+  note() { this.calls.push(Date.now()); this.lastAt = Date.now(); },
+  // Pre-checks are a bonus: only when there's plenty of headroom, and spaced out
+  // (Anthropic enforces per-minute limits in short windows, so bursts get rejected).
+  canPrecheck() {
+    const now = Date.now();
+    if (now < this.cooldownUntil) return false;
+    if (this.recent() >= Math.floor(this.limit * 0.6)) return false;
+    return now - this.lastAt >= (60000 / this.limit) * 1.2;
+  },
+  onRateInfo(rl) {
+    if (!rl || !rl.limit) return;
+    this.limit = rl.limit;
+    if (rl.remaining != null && rl.remaining < Math.max(5, rl.limit * 0.15)) this.cooldownUntil = Date.now() + 10000;
+  },
+  onError(kind) {
+    this.troubleAt = Date.now();
+    if (kind === 'rate') this.cooldownUntil = Date.now() + 20000;
+  },
+  unstable() { return Date.now() - this.troubleAt < 60000; },
+};
+
+class JudgeError extends Error {
+  constructor(msg, kind) { super(msg); this.kind = kind; }
+}
+
+async function callJudge(category, answer, previous, { timeoutMs = 9500 } = {}) {
+  aiGate.note();
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 9000);
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const r = await fetch('api/judge', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ category, answer, previous }),
-      signal: ctrl.signal,
-    });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const j = await r.json();
-    if (!['pass', 'fail', 'unsure'].includes(j.verdict)) throw new Error('bad verdict');
-    return { pass: j.verdict !== 'fail', unsure: j.verdict === 'unsure', reason: j.reason || '' };
+    let r;
+    try {
+      r = await fetch('api/judge', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ category, answer, previous }),
+        signal: ctrl.signal,
+      });
+    } catch (err) {
+      throw new JudgeError(String(err && err.message), ctrl.signal.aborted ? 'timeout' : 'network');
+    }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new JudgeError(j.error || `HTTP ${r.status}`, j.kind || 'other');
+    aiGate.onRateInfo(j.rateLimit);
+    if (!['pass', 'fail', 'unsure'].includes(j.verdict)) throw new JudgeError('bad verdict', 'other');
+    return { pass: j.verdict !== 'fail', unsure: j.verdict === 'unsure', reason: j.reason || '', model: j.model };
+  } catch (err) {
+    aiGate.onError(err.kind);
+    throw err;
   } finally {
     clearTimeout(t);
   }
@@ -173,6 +226,7 @@ const PRECHECK_AHEAD = 2;
 const precheck = new Map(); // key -> { promise, result }
 const drafts = new Map(); // playerId -> latest typed text
 let precheckCat = 0;
+let precheckRetry = null;
 
 function aiOn() { return settings.judge === 'ai' && aiAvailable; }
 
@@ -185,7 +239,7 @@ function judgeCached(category, text, previous) {
   let e = precheck.get(key);
   if (!e) {
     e = { promise: callJudge(category, text, previous), result: null };
-    e.promise.then((r) => { e.result = r; }, () => { precheck.delete(key); });
+    e.promise.then((r) => { e.result = r; }, () => { if (precheck.get(key) === e) precheck.delete(key); });
     precheck.set(key, e);
   }
   return e;
@@ -203,17 +257,21 @@ function upcomingIds() {
   return ids;
 }
 
+// Returns false if it wanted to pre-check but the rate budget said "not now".
 function prejudge(id) {
-  if (!aiOn() || ![PHASE.NEWCAT, PHASE.TURN, PHASE.VERDICT].includes(engine.phase)) return;
-  if (!upcomingIds().includes(id)) return;
+  if (!aiOn() || ![PHASE.NEWCAT, PHASE.TURN, PHASE.VERDICT].includes(engine.phase)) return true;
+  if (!upcomingIds().includes(id)) return true;
   const text = drafts.get(id);
   const key = normalizeAnswer(text);
   const previous = engine.answers.map((a) => a.text);
   // While a correct answer is on screen it's about to join the list, so check against that future list.
   const v = engine.verdict;
   if (engine.phase === PHASE.VERDICT && v && v.pass && v.text) previous.push(v.text);
-  if (!key || previous.some((t) => normalizeAnswer(t) === key)) return; // empty or exact duplicate: no AI needed
+  if (!key || previous.some((t) => normalizeAnswer(t) === key)) return true; // empty or exact duplicate: no AI needed
+  if (precheck.has(judgeKey(engine.category, text, previous.length))) return true;
+  if (!aiGate.canPrecheck()) return false;
   judgeCached(engine.category, text, previous).promise.catch(() => {});
+  return true;
 }
 
 function prejudgeUpcoming() {
@@ -223,7 +281,12 @@ function prejudgeUpcoming() {
     precheck.clear();
     drafts.clear();
   }
-  for (const id of upcomingIds()) prejudge(id);
+  let blocked = false;
+  for (const id of upcomingIds()) {
+    if (!prejudge(id)) { blocked = true; break; } // current player first, then next in line
+  }
+  clearTimeout(precheckRetry);
+  if (blocked) precheckRetry = setTimeout(prejudgeUpcoming, 600);
 }
 
 function onDraft(id, raw) {
@@ -231,30 +294,51 @@ function onDraft(id, raw) {
   if (!p || p.out) return;
   if (Number(raw && raw.cat) !== engine.categoryNo) return; // typed for an older category
   drafts.set(id, String((raw && raw.text) || '').trim().slice(0, 60));
-  prejudge(id);
+  prejudgeUpcoming();
+}
+
+function raceUntil(promise, deadline) {
+  return Promise.race([
+    promise.then((r) => ({ ok: true, r }), (err) => ({ ok: false, err })),
+    new Promise((res) => setTimeout(() => res({ ok: false, slow: true }), Math.max(0, deadline - Date.now()))),
+  ]);
 }
 
 async function runJudge(sub) {
   const useAI = aiOn();
   judgeState = { turnNo: sub.turnNo, status: useAI ? 'ai' : 'manual' };
   if (!useAI) { render(); return; }
-  const e = judgeCached(sub.category, sub.text, sub.previous);
+  let e = judgeCached(sub.category, sub.text, sub.previous);
   if (e.result) { // pre-checked: instant verdict
     if (engine.judged(sub.turnNo, e.result)) update();
     return;
   }
   render();
-  try {
-    const res = await e.promise;
-    if (engine.judged(sub.turnNo, res)) update();
-  } catch (err) {
-    console.warn('AI judge failed', err);
-    if (judgeState && judgeState.turnNo === sub.turnNo) {
-      judgeState.status = 'manual';
-      judgeState.error = true;
-      render();
-    }
+  const deadline = Date.now() + AI_WAIT_MS;
+  let out = null;
+  for (let i = 0; i < 3; i++) {
+    out = await raceUntil(e.promise, deadline);
+    if (out.ok || out.slow) break;
+    const kind = out.err && out.err.kind;
+    if (kind === 'auth' || kind === 'credit') break; // retrying won't help
+    if (deadline - Date.now() < 1200) break;
+    e = judgeCached(sub.category, sub.text, sub.previous); // a failed pre-check: ask again
   }
+  if (out && out.ok) {
+    if (engine.judged(sub.turnNo, out.r)) update();
+    return;
+  }
+  console.warn('AI judge gave up', out);
+  if (!judgeState || judgeState.turnNo !== sub.turnNo) return;
+  if (settings.aiFallback === 'host') {
+    judgeState.status = 'manual';
+    judgeState.error = true;
+    render();
+    return;
+  }
+  // Keep the game moving: benefit of the doubt. Host can still overrule with O.
+  const reason = out && out.slow ? 'AI 太慢了，先算你過' : 'AI 沒回應，先算你過';
+  if (engine.judged(sub.turnNo, { pass: true, fallback: true, reason })) update();
 }
 
 function manualJudge(pass) {
@@ -469,6 +553,12 @@ const TEMPLATES = {
               <option value="host">主持人判定</option>
             </select>
           </label>
+          <label>AI 沒回應時
+            <select id="setFallback">
+              <option value="pass">先算通過（不卡）</option>
+              <option value="host">讓主持人判定</option>
+            </select>
+          </label>
           <label>題目
             <select id="setSource">
               <option value="bank">內建題庫</option>
@@ -477,7 +567,7 @@ const TEMPLATES = {
             </select>
           </label>
           <textarea id="setCustom" rows="3" placeholder="自訂題目：一行一題，例如&#10;YouTube 點擊量 50 萬以上的音樂"></textarea>
-          <p class="ai-status" id="aiStatus"></p>
+          <div class="ai-status"><span id="aiStatus"></span> <button class="btn ghost small" data-action="test-ai" id="testAiBtn" hidden>再測一次</button></div>
         </div>
         <button class="btn big primary" id="startBtn" data-action="start">開始遊戲</button>
       </div>
@@ -581,6 +671,9 @@ function mountLobby() {
   const judge = $('#setJudge');
   judge.value = settings.judge;
   judge.onchange = () => { settings.judge = judge.value; saveSettings(); render(); };
+  const fb = $('#setFallback');
+  fb.value = settings.aiFallback;
+  fb.onchange = () => { settings.aiFallback = fb.value; saveSettings(); };
   const src = $('#setSource');
   src.value = settings.source;
   src.onchange = () => { settings.source = src.value; saveSettings(); cats.prime(); render(); };
@@ -626,13 +719,37 @@ function renderLobby() {
   btn.textContent = engine.canStart() ? `開始遊戲（${n} 人）` : `至少要 ${min} 人才能開始（目前 ${n}）`;
   $('#ruleSec').textContent = settings.turnSeconds;
 
-  const ai = $('#aiStatus');
-  if (aiAvailable) ai.innerHTML = '✅ AI 裁判已就緒（Claude）';
-  else ai.innerHTML = '⚠️ 沒偵測到 AI 裁判（Vercel 需設定 <code>ANTHROPIC_API_KEY</code>），會改用主持人判定與內建題庫。';
+  setHTML($('#aiStatus'), aiStatusHTML());
+  $('#testAiBtn').hidden = !aiConfigured || aiHealth.state === 'testing';
+}
+
+function aiStatusHTML() {
+  if (!aiConfigured) return '⚠️ 沒偵測到 AI 裁判（Vercel 需設定 <code>ANTHROPIC_API_KEY</code>），會改用主持人判定與內建題庫。';
+  const h = aiHealth;
+  if (h.state === 'testing') return '<span class="spinner"></span> 正在測試 AI 裁判…';
+  if (h.state === 'ok') {
+    const secs = (h.ms / 1000).toFixed(1);
+    const slow = h.ms > 2500 ? '（有點慢，遊戲中會靠預先查核補回來）' : '';
+    const tier = aiGate.limit <= 60
+      ? `<br><small>速率上限 ${aiGate.limit} 次/分（Tier 1）。8 人局可能偶爾碰到上限；累積儲值 US$40 升到 Tier 2 就幾乎不會。</small>`
+      : `<br><small>速率上限 ${aiGate.limit} 次/分，很夠用。</small>`;
+    return `✅ AI 裁判正常（回應 ${secs} 秒${slow}）${tier}`;
+  }
+  const msg = {
+    auth: '❌ API key 無效。請到 Claude Console 重新建立，並更新 Vercel 的 <code>ANTHROPIC_API_KEY</code>。',
+    credit: '❌ API 額度不足。請到 Claude Console → Billing 儲值。',
+    model: '❌ 找不到指定的模型，請檢查 <code>ANTHROPIC_MODEL</code>。',
+    rate: '⚠️ 剛剛碰到速率上限，等一下再測。',
+    overloaded: '⚠️ Claude 目前有點忙，等一下再測。遊戲中會自動重試。',
+    timeout: '⚠️ AI 回應逾時，等一下再測。',
+    network: '⚠️ 連不到 AI（網路問題？），等一下再測。',
+  }[h.kind] || '⚠️ AI 測試失敗，等一下再測。';
+  const fallback = aiAvailable ? '' : '<br><small>目前改用主持人判定。</small>';
+  return msg + fallback;
 }
 
 function judgeLabel() {
-  if (settings.judge === 'ai' && aiAvailable) return '🤖 AI 裁判';
+  if (settings.judge === 'ai' && aiAvailable) return aiGate.unstable() ? '🤖 AI 裁判 ⚠️ 不穩' : '🤖 AI 裁判';
   return '🧑‍⚖️ 主持人判定';
 }
 
@@ -686,7 +803,7 @@ function renderGame() {
         ${v.text ? `<div class="said">「${esc(v.text)}」</div>` : ''}
         <div class="stamp">${v.pass ? '通過！' : v.eliminates ? '出局！' : '✕ 不通過'}</div>
         <div class="reason">${esc(v.reason || '')}
-          ${v.unsure ? '<span class="tag">AI 不太確定</span>' : ''}
+          ${v.fallback ? '<span class="tag warn">AI 沒回應</span>' : v.unsure ? '<span class="tag">AI 不太確定</span>' : ''}
           ${v.overruled ? '<span class="tag">主持人改判</span>' : ''}</div>
         <button class="btn ghost small" data-action="overrule">⚖️ 推翻判決 <kbd>O</kbd></button>
       </div>`;
@@ -781,6 +898,7 @@ document.addEventListener('click', (e) => {
     case 'judge-pass': manualJudge(true); break;
     case 'judge-fail': manualJudge(false); break;
     case 'overrule': overrule(); break;
+    case 'test-ai': testAI(); break;
     default: break;
   }
 });
@@ -807,17 +925,44 @@ window.addEventListener('beforeunload', (e) => {
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') keepAwake(); });
 
 // ---------------- boot ----------------
+// aiConfigured: the server has a key. aiAvailable: we'll actually use AI judging.
+let aiConfigured = false;
+let aiHealth = { state: 'unknown' };
+
 async function checkAI() {
   try {
     const r = await fetch('api/judge', { cache: 'no-store' });
     const j = await r.json();
-    aiAvailable = !!j.ai;
+    aiConfigured = !!j.ai;
   } catch {
-    aiAvailable = false;
+    aiConfigured = false;
   }
+  aiAvailable = aiConfigured;
+  render();
+  if (aiConfigured) await testAI();
   cats.prime();
+}
+
+// A real judge call before the game, so key / credit / model problems show up in the lobby, not mid-game.
+async function testAI() {
+  aiHealth = { state: 'testing' };
+  render();
+  const t0 = performance.now();
+  try {
+    await callJudge('水果', '香蕉', [], { timeoutMs: 12000 });
+    aiHealth = { state: 'ok', ms: performance.now() - t0 };
+    aiAvailable = true;
+    aiGate.troubleAt = 0;
+  } catch (err) {
+    aiHealth = { state: 'error', kind: err.kind || 'other' };
+    // Permanent problems: switch to host judging. Temporary ones: keep AI on (the game handles hiccups).
+    aiAvailable = !['auth', 'credit', 'model'].includes(err.kind);
+  }
   render();
 }
+
+// Keep the serverless function warm so the first answer isn't slow.
+setInterval(() => { fetch('api/judge', { cache: 'no-store' }).catch(() => {}); }, 4 * 60 * 1000);
 
 function boot() {
   if (!window.Peer) {

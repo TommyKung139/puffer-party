@@ -25,7 +25,7 @@ export function normalizeAnswer(s) {
 export class Engine {
   constructor(opts = {}) {
     const { pickCategory, ...settings } = opts;
-    this.settings = { turnSeconds: 5, maxStrikes: 3, minPlayers: 4, maxPlayers: 8, ...settings };
+    this.settings = { turnSeconds: 5, maxStrikes: 3, minPlayers: 2, maxPlayers: 8, ...settings };
     this.pickCategory = pickCategory || (() => '自由發揮');
     this.players = [];
     this.phase = PHASE.LOBBY;
@@ -181,11 +181,11 @@ export class Engine {
   }
 
   // Result from AI or host. Ignored if it's for a stale turn.
-  judged(turnNo, { pass, reason = '', unsure = false } = {}) {
+  judged(turnNo, { pass, reason = '', unsure = false, fallback = false } = {}) {
     if (this.phase !== PHASE.JUDGING || !this.pending || this.pending.turnNo !== turnNo) return false;
     const { text, key } = this.pending;
     this.pending = null;
-    this._setVerdict({ pass: !!pass, unsure: !!unsure, reason, text, key });
+    this._setVerdict({ pass: !!pass, unsure: !!unsure, fallback: !!fallback, reason, text, key });
     return true;
   }
 
@@ -234,7 +234,7 @@ export class Engine {
   }
 
   _setVerdict(v) {
-    this.verdict = { overruled: false, unsure: false, ...v, playerId: this.currentId };
+    this.verdict = { overruled: false, unsure: false, fallback: false, ...v, playerId: this.currentId };
     this.verdict.eliminates = this._wouldEliminate(this.verdict);
     this.phase = PHASE.VERDICT;
   }

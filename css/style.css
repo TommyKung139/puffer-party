@@ -153,7 +153,7 @@ kbd {
 .kick:hover { opacity: 1 !important; }
 
 .settings {
-  display: grid; grid-template-columns: repeat(3, 1fr); gap: .8rem;
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: .8rem;
   background: rgba(0,0,0,.18); border-radius: 18px; padding: 1rem;
 }
 .settings label { display: flex; flex-direction: column; gap: .3rem; font-weight: 700; font-size: .9rem; opacity: .9; }
@@ -162,7 +162,10 @@ kbd {
   border: 0; border-radius: 10px; padding: .5rem .6rem;
 }
 .settings textarea { grid-column: 1 / -1; font-weight: 500; resize: vertical; }
-.ai-status { grid-column: 1 / -1; margin: 0; font-size: .9rem; opacity: .85; }
+.ai-status { grid-column: 1 / -1; margin: 0; font-size: .9rem; opacity: .9; line-height: 1.5; }
+.ai-status small { opacity: .75; }
+.ai-status .btn { margin-left: .4rem; vertical-align: middle; }
+.tag.warn { background: var(--coral); color: #fff; }
 #startBtn { align-self: stretch; font-size: 1.6rem; }
 
 .rules {
